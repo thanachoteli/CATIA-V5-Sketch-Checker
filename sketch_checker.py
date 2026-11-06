@@ -32,6 +32,17 @@ DIMENSIONAL_TYPES = {
     "catCstTypeMinorRadius", "catCstTypeCylinderRadius",
 }
 
+# Types that are treated as the SAME when comparing. Edit to suit the course.
+# Left side = type found, right side = type it is treated as.
+# Horizontal / vertical are orientation constraints, and the CATIA sketcher
+# creates them automatically when a student draws with the Rectangle tool.
+EQUIVALENT_TYPES = {
+    "catCstTypeHorizontality": "catCstTypeParallelism",
+    "catCstTypeVerticality": "catCstTypeParallelism",
+    # Uncomment to accept Length and Distance as interchangeable dimensions:
+    # "catCstTypeLength": "catCstTypeDistance",
+}
+
 # Friendlier names for the report
 FRIENDLY_TYPES = {
     "catCstTypeOn": "Coincidence / point-on",
@@ -44,6 +55,11 @@ FRIENDLY_TYPES = {
 
 DEFAULT_TOL = 1e-3          # mm (or deg for angles)
 SIMILARITY_MIN = 0.5        # min similarity to match a renamed sketch
+
+
+def canon(type_name):
+    """Type name used for comparing (applies EQUIVALENT_TYPES)."""
+    return EQUIVALENT_TYPES.get(type_name, type_name)
 
 
 # ----------------------------------------------------------------------------
@@ -70,8 +86,12 @@ def get_active_part():
     from pycatia import catia
     from pycatia.mec_mod_interfaces.part_document import PartDocument
 
-    caa = catia()
-    active_doc = caa.active_document
+    try:
+        caa = catia()
+        active_doc = caa.active_document
+    except Exception as e:
+        sys.exit(f"Could not connect to CATIA. Is it running with a part "
+                 f"open?\n({e})")
     if type(active_doc) is not PartDocument:
         sys.exit("A CATPart document must be the active document.")
     return active_doc, active_doc.part
@@ -151,12 +171,15 @@ def extract_part_sketches():
 # ----------------------------------------------------------------------------
 # Baseline I/O
 # ----------------------------------------------------------------------------
-def save_baseline(doc_name, sketches, out_dir):
-    json_path = out_dir / f"{doc_name}_baseline.json"
-    csv_path = out_dir / f"{doc_name}_baseline.csv"
+def save_baseline(out_dir, stem, part_name, sketches):
+    """Write <stem>.json and <stem>.csv into out_dir."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{stem}.json"
+    csv_path = out_dir / f"{stem}.csv"
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"part_name": doc_name, "sketches": sketches}, f, indent=2)
+        json.dump({"part_name": part_name, "sketches": sketches}, f, indent=2)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, quoting=csv.QUOTE_ALL)
@@ -174,20 +197,38 @@ def load_baseline(path):
     if not path.exists():
         sys.exit(f"Baseline file not found: {path}")
 
-    if path.suffix.lower() == ".json":
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)["sketches"]
+    try:
+        if path.suffix.lower() == ".json":
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)["sketches"]
 
-    sketches = {}
-    with open(path, encoding="utf-8", newline="") as f:
-        for row in csv.DictReader(f):
-            val = row["Value"].strip()
-            sketches.setdefault(row["Sketch Name"], []).append({
-                "name": row["Constraint Name"], "type": row["Type"],
-                "status": row["Status"],
-                "value": float(val) if val else None,
-            })
-    return sketches
+        sketches = {}
+        with open(path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                val = row["Value"].strip()
+                sketches.setdefault(row["Sketch Name"], []).append({
+                    "name": row["Constraint Name"], "type": row["Type"],
+                    "status": row["Status"],
+                    "value": float(val) if val else None,
+                })
+        return sketches
+    except (KeyError, ValueError, json.JSONDecodeError) as e:
+        sys.exit(f"Baseline file is not valid ({path.name}): {e!r}")
+
+
+def find_default_baseline():
+    here = Path(__file__).resolve().parent
+    exact = here / "baseline.json"
+    if exact.exists():
+        return exact
+    found = sorted(here.glob("*_baseline.json"))
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        sys.exit("Several *_baseline.json files found next to the script. "
+                 "Choose one with -b path/to/file.json")
+    sys.exit("No baseline found next to the script. "
+             "Use -b path/to/baseline.json")
 
 
 # ----------------------------------------------------------------------------
@@ -202,7 +243,7 @@ def _same_value(a, b, tol):
 
 
 def _signature(constraints):
-    return Counter((c["type"],
+    return Counter((canon(c["type"]),
                     None if c["value"] is None else round(c["value"], 3))
                    for c in constraints)
 
@@ -222,7 +263,7 @@ def compare_sketch(base, stud, tol):
     # Pass 1: exact matches (same type, same value within tolerance)
     for bi in b_left[:]:
         for si in s_left:
-            if (base[bi]["type"] == stud[si]["type"]
+            if (canon(base[bi]["type"]) == canon(stud[si]["type"])
                     and _same_value(base[bi]["value"], stud[si]["value"], tol)):
                 b_left.remove(bi)
                 s_left.remove(si)
@@ -235,7 +276,7 @@ def compare_sketch(base, stud, tol):
         if base[bi]["value"] is None:
             continue
         cands = [si for si in s_left
-                 if stud[si]["type"] == base[bi]["type"]
+                 if canon(stud[si]["type"]) == canon(base[bi]["type"])
                  and stud[si]["value"] is not None]
         if cands:
             si = min(cands, key=lambda k: abs(stud[k]["value"] - base[bi]["value"]))
@@ -257,7 +298,7 @@ def _label(t):
 
 
 def _fmt(v):
-    return f"{v:g}"
+    return ("%.4f" % v).rstrip("0").rstrip(".")
 
 
 def build_report(baseline, student, tol):
@@ -265,7 +306,7 @@ def build_report(baseline, student, tol):
     total_base = sum(len(v) for v in baseline.values())
     total_ok = 0
 
-    # --- match sketches by name, then by similarity for renamed ones
+    # --- match sketches by name first
     norm = lambda s: s.strip().lower()
     stud_by_norm = {norm(k): k for k in student}
     pairs, base_unmatched = [], []
@@ -275,18 +316,22 @@ def build_report(baseline, student, tol):
             pairs.append((bname, sname, False))
         else:
             base_unmatched.append(bname)
+    stud_unmatched = list(stud_by_norm.values())
 
-    stud_unmatched = [stud_by_norm[k] for k in stud_by_norm]
-    for bname in base_unmatched[:]:
-        best, score = None, 0.0
-        for sname in stud_unmatched:
-            sc = _similarity(baseline[bname], student[sname])
-            if sc > score:
-                best, score = sname, sc
-        if best is not None and score >= SIMILARITY_MIN:
-            pairs.append((bname, best, True))
+    # --- then pair renamed sketches, best similarity first
+    cands = sorted(((_similarity(baseline[b], student[s]), b, s)
+                    for b in base_unmatched for s in stud_unmatched),
+                   key=lambda t: t[0], reverse=True)
+    for score, bname, sname in cands:
+        if score < SIMILARITY_MIN:
+            break
+        if bname in base_unmatched and sname in stud_unmatched:
+            pairs.append((bname, sname, True))
             base_unmatched.remove(bname)
-            stud_unmatched.remove(best)
+            stud_unmatched.remove(sname)
+
+    order = {b: i for i, b in enumerate(baseline)}
+    pairs.sort(key=lambda p: order[p[0]])
 
     # --- per-sketch comparison
     for bname, sname, renamed in pairs:
@@ -359,18 +404,26 @@ def build_report(baseline, student, tol):
 # ----------------------------------------------------------------------------
 def cmd_baseline(args):
     doc_name, doc_dir, sketches = extract_part_sketches()
-    out_dir = Path(args.output).parent if args.output else doc_dir
-    if args.output:
-        doc_name = Path(args.output).stem
     n = sum(len(v) for v in sketches.values())
+    if n == 0:
+        sys.exit("No sketch constraints found in the active part - "
+                 "baseline not written.")
+
+    if args.output:
+        out = Path(args.output)
+        if out.suffix.lower() in (".json", ".csv"):
+            out = out.with_suffix("")
+        out_dir, stem = out.parent, out.name       # used exactly as given
+    else:
+        out_dir, stem = doc_dir, f"{doc_name}_baseline"
+
     print(f"\nFound {len(sketches)} sketch(es), {n} constraint(s)")
-    json_path, csv_path = save_baseline(doc_name, sketches, out_dir)
+    json_path, csv_path = save_baseline(out_dir, stem, doc_name, sketches)
     print(f"Baseline saved:\n  {json_path}\n  {csv_path}")
 
 
 def cmd_check(args):
-    default = Path(__file__).with_name("baseline.json")
-    baseline = load_baseline(args.baseline or default)
+    baseline = load_baseline(args.baseline or find_default_baseline())
     doc_name, doc_dir, student = extract_part_sketches()
     report = build_report(baseline, student, args.tol)
     print("\n" + report)
@@ -388,13 +441,14 @@ def main():
 
     pb = sub.add_parser("baseline", help="(instructor) export baseline")
     pb.add_argument("-o", "--output",
-                    help="output base path, e.g. C:/x/plate (default: next to part)")
+                    help="output path without extension, e.g. C:/x/plate_baseline "
+                         "(default: <PartName>_baseline next to the part)")
     pb.set_defaults(func=cmd_baseline)
 
     pc = sub.add_parser("check", help="(student) compare with baseline")
     pc.add_argument("-b", "--baseline",
-                    help="baseline .json or .csv (default: baseline.json "
-                         "next to this script)")
+                    help="baseline .json or .csv (default: baseline.json or the "
+                         "single *_baseline.json next to this script)")
     pc.add_argument("--tol", type=float, default=DEFAULT_TOL,
                     help=f"value tolerance (default {DEFAULT_TOL})")
     pc.set_defaults(func=cmd_check)
