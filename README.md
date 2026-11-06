@@ -7,7 +7,7 @@ It was built for a CAD course so that an instructor does not need to check every
 ## How it works
 
 1. The instructor opens the correct CATPart and exports a baseline (`.json` and `.csv`).
-2. The instructor gives the `.json` file to the students (the baseline should not be shown to student?).
+2. The instructor gives the `.json` file to the students.
 3. A student opens their own CATPart and runs the check. The script reads every sketch and constraint in the active part and prints a report: pass or fail, a score, and a list of problems.
 
 Constraints are compared by **type and value, not by name**. A student's constraints will have default names such as `Constraint.12`, so name-matching would flag everyone as wrong. Within each sketch, constraints are compared in any order.
@@ -57,7 +57,7 @@ python sketch_checker.py check -b plate_baseline.json --tol 0.01
 ```
 
 ## Example report
-
+The output report should be display in terminal and save as a text file.jk
 ```
 ======================================================================
 SKETCH CHECK REPORT
