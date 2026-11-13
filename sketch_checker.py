@@ -25,6 +25,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import re
+from collections import Counter, defaultdict   # replace the existing Counter import
+
+# CATIA default names look like "Constraint.12". Never trust these as identity.
+DEFAULT_NAME = re.compile(r"^[A-Za-z_ ]+\.\d+$")
+
+def _named(c):
+    return bool(c["name"]) and not DEFAULT_NAME.match(c["name"])
+
 # Constraint types that carry a dimension value (compared by enum name)
 DIMENSIONAL_TYPES = {
     "catCstTypeDistance", "catCstTypeLength", "catCstTypeAngle",
@@ -255,43 +264,70 @@ def _similarity(a, b):
 
 
 def compare_sketch(base, stud, tol):
-    """Compare one sketch. Returns dict describing the differences."""
-    b_left = list(range(len(base)))
-    s_left = list(range(len(stud)))
-    matched = 0
+    """Tiered matching. Returns matched count and categorised differences.
 
-    # Pass 1: exact matches (same type, same value within tolerance)
-    for bi in b_left[:]:
-        for si in s_left:
+    wrong:     [(base_item, stud_item, identity_confirmed)]
+    ambiguous: [(canon_type, [base_items], [stud_items])]
+    """
+    b_left, s_left = set(range(len(base))), set(range(len(stud)))
+    matched, wrong = 0, []
+
+    # Tier 1: identity by user-given name + same canonical type
+    s_by_name = defaultdict(list)
+    for si in sorted(s_left):
+        if _named(stud[si]):
+            s_by_name[stud[si]["name"].strip().lower()].append(si)
+    for bi in sorted(b_left):
+        if not _named(base[bi]):
+            continue
+        cands = [si for si in s_by_name.get(base[bi]["name"].strip().lower(), [])
+                 if si in s_left
+                 and canon(stud[si]["type"]) == canon(base[bi]["type"])]
+        if len(cands) != 1:
+            continue
+        si = cands[0]
+        b_left.discard(bi); s_left.discard(si)
+        if _same_value(base[bi]["value"], stud[si]["value"], tol):
+            matched += 1
+        else:
+            wrong.append((base[bi], stud[si], True))
+
+    # Tier 2: exact (type, value). Equal items are interchangeable, so which
+    # baseline entry gets consumed must never be reported later.
+    for bi in sorted(b_left):
+        for si in sorted(s_left):
             if (canon(base[bi]["type"]) == canon(stud[si]["type"])
                     and _same_value(base[bi]["value"], stud[si]["value"], tol)):
-                b_left.remove(bi)
-                s_left.remove(si)
+                b_left.discard(bi); s_left.discard(si)
                 matched += 1
                 break
 
-    # Pass 2: same type but wrong value -> pair up closest values
-    wrong = []
-    for bi in b_left[:]:
-        if base[bi]["value"] is None:
-            continue
-        cands = [si for si in s_left
-                 if canon(stud[si]["type"]) == canon(base[bi]["type"])
-                 and stud[si]["value"] is not None]
-        if cands:
-            si = min(cands, key=lambda k: abs(stud[k]["value"] - base[bi]["value"]))
-            wrong.append((base[bi], stud[si]))
-            b_left.remove(bi)
-            s_left.remove(si)
+    # Tier 3: leftovers with values, grouped by type. Pair only if unique.
+    b_by_t, s_by_t = defaultdict(list), defaultdict(list)
+    for bi in sorted(b_left):
+        if base[bi]["value"] is not None:
+            b_by_t[canon(base[bi]["type"])].append(bi)
+    for si in sorted(s_left):
+        if stud[si]["value"] is not None:
+            s_by_t[canon(stud[si]["type"])].append(si)
+
+    ambiguous = []
+    for t in sorted(set(b_by_t) & set(s_by_t)):
+        bl, sl = b_by_t[t], s_by_t[t]
+        if len(bl) == 1 and len(sl) == 1:
+            wrong.append((base[bl[0]], stud[sl[0]], False))   # by elimination
+        else:
+            ambiguous.append((t, [base[i] for i in bl], [stud[i] for i in sl]))
+        b_left.difference_update(bl); s_left.difference_update(sl)
 
     return {
         "matched": matched,
         "wrong": wrong,
-        "missing": [base[i] for i in b_left],
-        "extra": [stud[i] for i in s_left],
+        "ambiguous": ambiguous,
+        "missing": [base[i] for i in sorted(b_left)],
+        "extra": [stud[i] for i in sorted(s_left)],
         "bad_status": [c for c in stud if c["status"] != "catCstStatusOK"],
     }
-
 
 def _label(t):
     return FRIENDLY_TYPES.get(t, t.replace("catCstType", ""))
@@ -301,7 +337,7 @@ def _fmt(v):
     return ("%.4f" % v).rstrip("0").rstrip(".")
 
 
-def build_report(baseline, student, tol):
+def build_report(baseline, student, tol, instructor=False):
     lines, errors, warnings = [], 0, 0
     total_base = sum(len(v) for v in baseline.values())
     total_ok = 0
@@ -341,18 +377,43 @@ def build_report(baseline, student, tol):
 
         if renamed:
             warnings += 1
-            problems.append(f"  [WARN] Sketch is called '{sname}' but should be "
-                            f"called '{bname}'.")
-        for b, s in r["wrong"]:
+            problems.append(f"  [WARN] Sketch is called '{sname}' but should be "f"called '{bname}'.")
+
+        for b, s, confirmed in r["wrong"]:
             errors += 1
-            problems.append(f"  [ERROR] Wrong {_label(b['type'])} value: expected "
-                            f"{_fmt(b['value'])}, found {_fmt(s['value'])}  "
-                            f"(baseline item: {b['name']})")
+            if instructor:
+                note = "" if confirmed else ", identity unconfirmed"
+                problems.append(
+                    f"  [ERROR] Wrong {_label(b['type'])} value: expected "
+                    f"{_fmt(b['value'])}, found {_fmt(s['value'])}  "
+                    f"(baseline: {b['name']}{note}; yours: {s['name']})")
+            else:
+                problems.append(
+                    f"  [ERROR] {_label(s['type'])} value differs on "
+                    f"'{s['name']}' (currently {_fmt(s['value'])}).")
+        for t, bl, sl in r["ambiguous"]:
+            errors += 1
+            names = ", ".join(sorted(f"'{s['name']}'" for s in sl))
+            extra = (f" Expected values: "
+                     f"{', '.join(sorted(_fmt(b['value']) for b in bl))}."
+                     if instructor else "")
+            problems.append(
+                f"  [ERROR] {_label(t)} values differ in this sketch, but the "
+                f"specific item cannot be determined (several similar items). "
+                f"Check: {names}.{extra}")
         for b in r["missing"]:
             errors += 1
-            v = f" = {_fmt(b['value'])}" if b["value"] is not None else ""
-            problems.append(f"  [ERROR] Missing {_label(b['type'])}{v}  "
-                            f"(baseline item: {b['name']})")
+            if instructor:
+                v = f" = {_fmt(b['value'])}" if b["value"] is not None else ""
+                problems.append(f"  [ERROR] Missing {_label(b['type'])}{v}  "
+                                f"(candidate baseline item: {b['name']}, "
+                                f"unconfirmed)")
+            else:
+                problems.append(f"  [ERROR] A {_label(b['type'])} constraint "
+                                f"appears to be missing.")
+        
+
+            
         for s in r["extra"]:
             warnings += 1
             v = f" = {_fmt(s['value'])}" if s["value"] is not None else ""
@@ -425,7 +486,7 @@ def cmd_baseline(args):
 def cmd_check(args):
     baseline = load_baseline(args.baseline or find_default_baseline())
     doc_name, doc_dir, student = extract_part_sketches()
-    report = build_report(baseline, student, args.tol)
+    report = build_report(baseline, student, args.tol, args.instructor)
     print("\n" + report)
     out = doc_dir / f"{doc_name}_check_report.txt"
     try:
@@ -451,6 +512,8 @@ def main():
                          "single *_baseline.json next to this script)")
     pc.add_argument("--tol", type=float, default=DEFAULT_TOL,
                     help=f"value tolerance (default {DEFAULT_TOL})")
+    pc.add_argument("--instructor", action="store_true",
+                    help="show instructor-only information in the report")
     pc.set_defaults(func=cmd_check)
 
     args = p.parse_args()
