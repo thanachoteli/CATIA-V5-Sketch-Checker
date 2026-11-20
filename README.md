@@ -38,6 +38,14 @@ This writes `<PartName>_baseline.json` and `<PartName>_baseline.csv` next to the
 python sketch_checker.py baseline -o C:/course/plate_baseline
 ```
 
+Updated: Now the output doesn't show the expected value. To show, add "--instructor" flag. 
+
+**Output modes**
+- Student mode (default): says which constraint differs, but does not show
+  expected values or baseline item names.
+- Instructor mode (`--instructor`): also shows expected values and baseline
+  names. Do not give this output to students.
+
 Distribute the `.json` file to students.
 
 ### Student: check your part

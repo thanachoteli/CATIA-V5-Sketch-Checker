@@ -4,13 +4,13 @@ R = "catCstTypeRadius"
 def c(name, v, t=R):
     return {"name": name, "type": t, "status": "catCstStatusOK", "value": v}
 
-def test_named_identity():                      # professor's case
+def test_named_identity():  # Prof Josh's case
     r = compare_sketch([c("A", 3), c("B", 3)], [c("A", 4), c("B", 3)], 1e-3)
     (b, s, confirmed), = r["wrong"]
     assert (b["name"], s["name"], confirmed) == ("A", "A", True)
     assert r["matched"] == 1
 
-def test_renamed_student_side_only():           # default names
+def test_renamed_student_side_only(): # default names
     r = compare_sketch([c("A", 3), c("B", 3)],
                        [c("Constraint.1", 4), c("Constraint.2", 3)], 1e-3)
     (b, s, confirmed), = r["wrong"]

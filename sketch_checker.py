@@ -411,8 +411,6 @@ def build_report(baseline, student, tol, instructor=False):
             else:
                 problems.append(f"  [ERROR] A {_label(b['type'])} constraint "
                                 f"appears to be missing.")
-        
-
             
         for s in r["extra"]:
             warnings += 1
